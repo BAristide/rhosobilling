@@ -1,0 +1,785 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: billing-dashboard-html
+  namespace: openstack
+data:
+  index.html: |
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>OpenStack Billing Dashboard</title>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                margin: 20px;
+                background-color: #f5f5f5;
+            }
+            .container {
+                max-width: 1200px;
+                margin: 0 auto;
+            }
+            .card {
+                background: white;
+                border-radius: 8px;
+                padding: 20px;
+                margin-bottom: 20px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            }
+            h1, h2 {
+                color: #333;
+            }
+            table {
+                width: 100%;
+                border-collapse: collapse;
+                margin-top: 20px;
+            }
+            th, td {
+                padding: 12px;
+                text-align: left;
+                border-bottom: 1px solid #ddd;
+            }
+            th {
+                background-color: #f8f9fa;
+                font-weight: bold;
+            }
+            .metric-box {
+                display: inline-block;
+                padding: 20px;
+                margin: 10px;
+                background: #007bff;
+                color: white;
+                border-radius: 5px;
+                text-align: center;
+                min-width: 150px;
+            }
+            .metric-value {
+                font-size: 2em;
+                font-weight: bold;
+            }
+            .metric-label {
+                font-size: 0.9em;
+                opacity: 0.9;
+            }
+            #refresh-status {
+                float: right;
+                color: #666;
+                font-size: 0.9em;
+            }
+            .error {
+                background-color: #f8d7da;
+                color: #721c24;
+                padding: 10px;
+                border-radius: 5px;
+                margin: 10px 0;
+            }
+            .success {
+                background-color: #d4edda;
+                color: #155724;
+                padding: 10px;
+                border-radius: 5px;
+                margin: 10px 0;
+            }
+            .zone-badge {
+                display: inline-block;
+                padding: 2px 8px;
+                border-radius: 3px;
+                font-size: 0.85em;
+                font-weight: bold;
+                margin-left: 5px;
+            }
+            .zone-dev {
+                background-color: #28a745;
+                color: white;
+            }
+            .zone-prod {
+                background-color: #dc3545;
+                color: white;
+            }
+            .editable {
+                background: #f8f9fa;
+                border: 1px solid #ced4da;
+                padding: 4px 8px;
+                border-radius: 4px;
+                min-width: 100px;
+                display: inline-block;
+            }
+            .edit-mode .editable {
+                background: white;
+                border-color: #007bff;
+            }
+            .btn {
+                padding: 8px 16px;
+                margin: 5px;
+                border: none;
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 14px;
+            }
+            .btn-primary {
+                background: #007bff;
+                color: white;
+            }
+            .btn-success {
+                background: #28a745;
+                color: white;
+            }
+            .btn-danger {
+                background: #dc3545;
+                color: white;
+            }
+            .btn:hover {
+                opacity: 0.9;
+            }
+            .pricing-controls {
+                margin-top: 20px;
+                text-align: right;
+            }
+            .pricing-info {
+                background: #e9ecef;
+                padding: 10px;
+                border-radius: 4px;
+                margin-bottom: 10px;
+                font-size: 0.9em;
+            }
+            .modal {
+                display: none;
+                position: fixed;
+                z-index: 1000;
+                left: 0;
+                top: 0;
+                width: 100%;
+                height: 100%;
+                background-color: rgba(0,0,0,0.5);
+            }
+            .modal-content {
+                background-color: white;
+                margin: 15% auto;
+                padding: 20px;
+                border-radius: 8px;
+                width: 80%;
+                max-width: 500px;
+            }
+            .modal-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 20px;
+            }
+            .close {
+                font-size: 28px;
+                font-weight: bold;
+                cursor: pointer;
+            }
+            .close:hover {
+                color: #666;
+            }
+            input[type="password"] {
+                width: 100%;
+                padding: 8px;
+                margin: 10px 0;
+                border: 1px solid #ced4da;
+                border-radius: 4px;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>OpenStack Billing Dashboard</h1>
+            <div id="refresh-status">Loading...</div>
+
+            <div id="error-message" style="display: none;" class="error"></div>
+            <div id="success-message" style="display: none;" class="success"></div>
+
+            <div class="card">
+                <h2>Summary</h2>
+                <div id="summary-metrics"></div>
+            </div>
+
+            <div class="card">
+                <h2>Instance Details</h2>
+                <table id="instances-table">
+                    <thead>
+                        <tr>
+                            <th>Instance Name</th>
+                            <th>Project</th>
+                            <th>Zone</th>
+                            <th>Flavor</th>
+                            <th>vCPUs</th>
+                            <th>Memory (GB)</th>
+                            <th>Disk (GB)</th>
+                            <th>Uptime (hours)</th>
+                            <th>Est. Cost (€/day)</th>
+                        </tr>
+                    </thead>
+                    <tbody id="instances-tbody">
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="card">
+                <h2>Project Summary</h2>
+                <table id="projects-table">
+                    <thead>
+                        <tr>
+                            <th>Project Name</th>
+                            <th>Active Instances</th>
+                            <th>Total vCPUs</th>
+                            <th>Total Memory (GB)</th>
+                            <th>Floating IPs</th>
+                            <th>Est. Daily Cost (€)</th>
+                        </tr>
+                    </thead>
+                    <tbody id="projects-tbody">
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="card">
+                <h2>Pricing Information</h2>
+                <div id="pricing-info" class="pricing-info"></div>
+                <table id="pricing-table">
+                    <thead>
+                        <tr>
+                            <th>Resource</th>
+                            <th>Price</th>
+                            <th>Unit</th>
+                        </tr>
+                    </thead>
+                    <tbody id="pricing-tbody">
+                    </tbody>
+                </table>
+                <div class="pricing-controls">
+                    <button id="edit-pricing-btn" class="btn btn-primary" onclick="startEditPricing()">Edit Pricing</button>
+                    <button id="save-pricing-btn" class="btn btn-success" style="display: none;" onclick="showAuthModal()">Save Changes</button>
+                    <button id="cancel-pricing-btn" class="btn btn-danger" style="display: none;" onclick="cancelEditPricing()">Cancel</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Authentication Modal -->
+        <div id="auth-modal" class="modal">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3>Authentication Required</h3>
+                    <span class="close" onclick="closeAuthModal()">&times;</span>
+                </div>
+                <p>Please enter your admin token to update pricing:</p>
+                <input type="password" id="auth-token" placeholder="Bearer token" />
+                <div style="margin-top: 20px;">
+                    <button class="btn btn-primary" onclick="savePricingWithAuth()">Authenticate & Save</button>
+                    <button class="btn btn-danger" onclick="closeAuthModal()">Cancel</button>
+                </div>
+            </div>
+        </div>
+
+        <script>
+            const METRICS_URL = '/metrics';
+            const API_URL = '/api/v1';
+            const REFRESH_INTERVAL = 30000; // 30 seconds
+
+            // Global variables
+            let currentPricing = {};
+            let editMode = false;
+            let originalPricing = {};
+
+            async function fetchMetrics() {
+                try {
+                    const response = await fetch(METRICS_URL);
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+                    const text = await response.text();
+                    return parsePrometheusMetrics(text);
+                } catch (error) {
+                    console.error('Error fetching metrics:', error);
+                    showError(`Error fetching metrics: ${error.message}`);
+                    return null;
+                }
+            }
+
+            async function fetchPricing() {
+                try {
+                    const response = await fetch(`${API_URL}/pricing`);
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+                    const data = await response.json();
+                    currentPricing = data.pricing;
+                    updatePricingInfo(data);
+                    return data.pricing;
+                } catch (error) {
+                    console.error('Error fetching pricing:', error);
+                    // Fallback to default pricing
+                    return {
+                        cpu_per_hour: 0.05,
+                        memory_gb_per_hour: 0.01,
+                        disk_gb_per_hour: 0.000137,
+                        floating_ip_per_hour: 0.0069
+                    };
+                }
+            }
+
+            function updatePricingInfo(data) {
+                const infoDiv = document.getElementById('pricing-info');
+                infoDiv.innerHTML = `
+                    <strong>Version:</strong> ${data.version || 'unknown'} | 
+                    <strong>Last Updated:</strong> ${new Date(data.last_updated).toLocaleString()} | 
+                    <strong>Updated By:</strong> ${data.updated_by || 'unknown'}
+                `;
+            }
+
+            function parsePrometheusMetrics(text) {
+                const metrics = {};
+                const lines = text.split('\n');
+
+                lines.forEach(line => {
+                    if (line.startsWith('#') || line.trim() === '') return;
+
+                    const match = line.match(/^(\w+)({[^}]+})?\s+(.+)$/);
+                    if (match) {
+                        const metricName = match[1];
+                        const labelsStr = match[2] || '';
+                        const value = parseFloat(match[3]);
+
+                        if (!metrics[metricName]) {
+                            metrics[metricName] = [];
+                        }
+
+                        const labels = {};
+                        if (labelsStr) {
+                            const labelMatches = labelsStr.matchAll(/(\w+)="([^"]+)"/g);
+                            for (const labelMatch of labelMatches) {
+                                labels[labelMatch[1]] = labelMatch[2];
+                            }
+                        }
+
+                        metrics[metricName].push({ labels, value });
+                    }
+                });
+
+                return metrics;
+            }
+
+            function updateDashboard(metrics, pricing) {
+                if (!metrics) return;
+
+                hideMessages();
+
+                // Update instances table
+                const instances = [];
+                const projects = {};
+
+                if (metrics.openstack_instance_uptime_hours) {
+                    metrics.openstack_instance_uptime_hours.forEach(metric => {
+                        const labels = metric.labels;
+                        const instanceId = labels.instance_id;
+
+                        // Find corresponding metrics
+                        const vcpus = metrics.openstack_instance_vcpus?.find(m =>
+                            m.labels.instance_id === instanceId)?.value || 0;
+                        const memory_mb = metrics.openstack_instance_memory_mb?.find(m =>
+                            m.labels.instance_id === instanceId)?.value || 0;
+                        const disk_gb = metrics.openstack_instance_disk_gb?.find(m =>
+                            m.labels.instance_id === instanceId)?.value || 0;
+
+                        const memory_gb = memory_mb / 1024;
+                        const daily_cost = 24 * (
+                            vcpus * pricing.cpu_per_hour +
+                            memory_gb * pricing.memory_gb_per_hour +
+                            disk_gb * pricing.disk_gb_per_hour
+                        );
+
+                        instances.push({
+                            name: labels.instance_name,
+                            project: labels.project_name,
+                            zone: labels.availability_zone,
+                            flavor: labels.flavor,
+                            vcpus: vcpus,
+                            memory_gb: memory_gb.toFixed(2),
+                            disk_gb: disk_gb,
+                            uptime: metric.value.toFixed(1),
+                            daily_cost: daily_cost.toFixed(2)
+                        });
+
+                        // Aggregate by project
+                        if (!projects[labels.project_name]) {
+                            projects[labels.project_name] = {
+                                instances: 0,
+                                vcpus: 0,
+                                memory_gb: 0,
+                                floating_ips: 0,
+                                daily_cost: 0
+                            };
+                        }
+                        projects[labels.project_name].instances += 1;
+                        projects[labels.project_name].vcpus += vcpus;
+                        projects[labels.project_name].memory_gb += memory_gb;
+                        projects[labels.project_name].daily_cost += daily_cost;
+                    });
+                }
+
+                // Add floating IPs to projects
+                if (metrics.openstack_floating_ip_count) {
+                    metrics.openstack_floating_ip_count.forEach(metric => {
+                        const projectName = metric.labels.project_name;
+                        if (!projects[projectName]) {
+                            projects[projectName] = {
+                                instances: 0,
+                                vcpus: 0,
+                                memory_gb: 0,
+                                floating_ips: 0,
+                                daily_cost: 0
+                            };
+                        }
+                        projects[projectName].floating_ips = metric.value;
+                        projects[projectName].daily_cost += metric.value * pricing.floating_ip_per_hour * 24;
+                    });
+                }
+
+                // Update instances table
+                const instancesTbody = document.getElementById('instances-tbody');
+                instancesTbody.innerHTML = instances.map(instance => `
+                    <tr>
+                        <td>${instance.name}</td>
+                        <td>${instance.project}</td>
+                        <td><span class="zone-badge zone-${instance.zone.replace('zone-', '')}">${instance.zone}</span></td>
+                        <td>${instance.flavor}</td>
+                        <td>${instance.vcpus}</td>
+                        <td>${instance.memory_gb}</td>
+                        <td>${instance.disk_gb}</td>
+                        <td>${instance.uptime}</td>
+                        <td><strong>€${instance.daily_cost}</strong></td>
+                    </tr>
+                `).join('');
+
+                // Update projects table
+                const projectsTbody = document.getElementById('projects-tbody');
+                projectsTbody.innerHTML = Object.entries(projects).map(([name, data]) => `
+                    <tr>
+                        <td>${name}</td>
+                        <td>${data.instances}</td>
+                        <td>${data.vcpus}</td>
+                        <td>${data.memory_gb.toFixed(2)}</td>
+                        <td>${data.floating_ips}</td>
+                        <td><strong>€${data.daily_cost.toFixed(2)}</strong></td>
+                    </tr>
+                `).join('');
+
+                // Update summary
+                const totalInstances = instances.length;
+                const totalDailyCost = Object.values(projects).reduce((sum, p) => sum + p.daily_cost, 0);
+                const totalVcpus = Object.values(projects).reduce((sum, p) => sum + p.vcpus, 0);
+                const totalMemoryGb = Object.values(projects).reduce((sum, p) => sum + p.memory_gb, 0);
+
+                // Check exporter health
+                const exporterHealth = metrics.openstack_billing_exporter_up?.[0]?.value || 0;
+
+                document.getElementById('summary-metrics').innerHTML = `
+                    <div class="metric-box">
+                        <div class="metric-value">${totalInstances}</div>
+                        <div class="metric-label">Active Instances</div>
+                    </div>
+                    <div class="metric-box">
+                        <div class="metric-value">${totalVcpus}</div>
+                        <div class="metric-label">Total vCPUs</div>
+                    </div>
+                    <div class="metric-box">
+                        <div class="metric-value">${totalMemoryGb.toFixed(1)} GB</div>
+                        <div class="metric-label">Total Memory</div>
+                    </div>
+                    <div class="metric-box">
+                        <div class="metric-value">€${totalDailyCost.toFixed(2)}</div>
+                        <div class="metric-label">Est. Daily Cost</div>
+                    </div>
+                    <div class="metric-box">
+                        <div class="metric-value">€${(totalDailyCost * 30).toFixed(2)}</div>
+                        <div class="metric-label">Est. Monthly Cost</div>
+                    </div>
+                    <div class="metric-box" style="background: ${exporterHealth === 1 ? '#28a745' : '#dc3545'}">
+                        <div class="metric-value">${exporterHealth === 1 ? 'UP' : 'DOWN'}</div>
+                        <div class="metric-label">Exporter Status</div>
+                    </div>
+                `;
+
+                // Update pricing table
+                updatePricingTable(pricing);
+
+                // Update refresh status
+                document.getElementById('refresh-status').textContent =
+                    `Last updated: ${new Date().toLocaleTimeString()}`;
+            }
+
+            function updatePricingTable(pricing) {
+                const pricingTbody = document.getElementById('pricing-tbody');
+                
+                if (editMode) {
+                    pricingTbody.innerHTML = `
+                        <tr>
+                            <td>vCPU</td>
+                            <td><input type="number" id="price-cpu" class="editable" value="${pricing.cpu_per_hour}" step="0.001" min="0"></td>
+                            <td>per hour</td>
+                        </tr>
+                        <tr>
+                            <td>Memory</td>
+                            <td><input type="number" id="price-memory" class="editable" value="${pricing.memory_gb_per_hour}" step="0.001" min="0"></td>
+                            <td>per GB per hour</td>
+                        </tr>
+                        <tr>
+                            <td>Disk</td>
+                            <td><input type="number" id="price-disk" class="editable" value="${pricing.disk_gb_per_hour}" step="0.000001" min="0"></td>
+                            <td>per GB per hour</td>
+                        </tr>
+                        <tr>
+                            <td>Floating IP</td>
+                            <td><input type="number" id="price-floating-ip" class="editable" value="${pricing.floating_ip_per_hour}" step="0.001" min="0"></td>
+                            <td>per hour</td>
+                        </tr>
+                    `;
+                } else {
+                    pricingTbody.innerHTML = `
+                        <tr>
+                            <td>vCPU</td>
+                            <td>${pricing.cpu_per_hour} €</td>
+                            <td>per hour</td>
+                        </tr>
+                        <tr>
+                            <td>Memory</td>
+                            <td>${pricing.memory_gb_per_hour} €</td>
+                            <td>per GB per hour</td>
+                        </tr>
+                        <tr>
+                            <td>Disk</td>
+                            <td>${pricing.disk_gb_per_hour} €</td>
+                            <td>per GB per hour</td>
+                        </tr>
+                        <tr>
+                            <td>Floating IP</td>
+                            <td>${pricing.floating_ip_per_hour} €</td>
+                            <td>per hour</td>
+                        </tr>
+                    `;
+                }
+            }
+
+            function startEditPricing() {
+                editMode = true;
+                originalPricing = {...currentPricing};
+                document.getElementById('edit-pricing-btn').style.display = 'none';
+                document.getElementById('save-pricing-btn').style.display = 'inline';
+                document.getElementById('cancel-pricing-btn').style.display = 'inline';
+                updatePricingTable(currentPricing);
+            }
+
+            function cancelEditPricing() {
+                editMode = false;
+                currentPricing = {...originalPricing};
+                document.getElementById('edit-pricing-btn').style.display = 'inline';
+                document.getElementById('save-pricing-btn').style.display = 'none';
+                document.getElementById('cancel-pricing-btn').style.display = 'none';
+                updatePricingTable(currentPricing);
+                hideMessages();
+            }
+
+            function showAuthModal() {
+                document.getElementById('auth-modal').style.display = 'block';
+            }
+
+            function closeAuthModal() {
+                document.getElementById('auth-modal').style.display = 'none';
+                document.getElementById('auth-token').value = '';
+            }
+
+            async function savePricingWithAuth() {
+                const token = document.getElementById('auth-token').value;
+                if (!token) {
+                    showError('Please enter an authentication token');
+                    return;
+                }
+
+                // Get values from form
+                const newPricing = {
+                    cpu_per_hour: parseFloat(document.getElementById('price-cpu').value),
+                    memory_gb_per_hour: parseFloat(document.getElementById('price-memory').value),
+                    disk_gb_per_hour: parseFloat(document.getElementById('price-disk').value),
+                    floating_ip_per_hour: parseFloat(document.getElementById('price-floating-ip').value)
+                };
+
+                try {
+                    const response = await fetch(`${API_URL}/pricing`, {
+                        method: 'PUT',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${token}`
+                        },
+                        body: JSON.stringify({
+                            pricing: newPricing,
+                            updated_by: 'dashboard'
+                        })
+                    });
+
+                    if (response.ok) {
+                        showSuccess('Pricing updated successfully!');
+                        currentPricing = newPricing;
+                        editMode = false;
+                        document.getElementById('edit-pricing-btn').style.display = 'inline';
+                        document.getElementById('save-pricing-btn').style.display = 'none';
+                        document.getElementById('cancel-pricing-btn').style.display = 'none';
+                        closeAuthModal();
+                        
+                        // Refresh pricing info
+                        await fetchPricing();
+                        await refresh();
+                    } else {
+                        const error = await response.json();
+                        showError(`Failed to update pricing: ${error.message || 'Unknown error'}`);
+                    }
+                } catch (error) {
+                    showError(`Error updating pricing: ${error.message}`);
+                }
+            }
+
+            function showError(message) {
+                const errorDiv = document.getElementById('error-message');
+                errorDiv.textContent = message;
+                errorDiv.style.display = 'block';
+                setTimeout(() => errorDiv.style.display = 'none', 5000);
+            }
+
+            function showSuccess(message) {
+                const successDiv = document.getElementById('success-message');
+                successDiv.textContent = message;
+                successDiv.style.display = 'block';
+                setTimeout(() => successDiv.style.display = 'none', 5000);
+            }
+
+            function hideMessages() {
+                document.getElementById('error-message').style.display = 'none';
+                document.getElementById('success-message').style.display = 'none';
+            }
+
+            async function refresh() {
+                const metrics = await fetchMetrics();
+                const pricing = await fetchPricing();
+                updateDashboard(metrics, pricing);
+            }
+
+            // Initial load and periodic refresh
+            refresh();
+            setInterval(refresh, REFRESH_INTERVAL);
+
+            // Close modal when clicking outside
+            window.onclick = function(event) {
+                const modal = document.getElementById('auth-modal');
+                if (event.target == modal) {
+                    closeAuthModal();
+                }
+            }
+        </script>
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: billing-dashboard
+  namespace: openstack
+  labels:
+    app: billing-dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: billing-dashboard
+  template:
+    metadata:
+      labels:
+        app: billing-dashboard
+    spec:
+      containers:
+      - name: nginx
+        image: nginxinc/nginx-unprivileged:alpine
+        ports:
+        - containerPort: 8080
+          name: http
+        volumeMounts:
+        - name: html
+          mountPath: /usr/share/nginx/html
+        - name: nginx-config
+          mountPath: /etc/nginx/conf.d
+      volumes:
+      - name: html
+        configMap:
+          name: billing-dashboard-html
+      - name: nginx-config
+        configMap:
+          name: billing-dashboard-nginx
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: billing-dashboard-nginx
+  namespace: openstack
+data:
+  default.conf: |
+    server {
+        listen 8080;
+        server_name localhost;
+
+        location / {
+            root /usr/share/nginx/html;
+            index index.html;
+        }
+
+        location /metrics {
+            proxy_pass http://billing-exporter:9999/metrics;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+        }
+        
+        location /api/ {
+            proxy_pass http://billing-api:8080/api/;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+    }
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: billing-dashboard
+  namespace: openstack
+  labels:
+    app: billing-dashboard
+spec:
+  ports:
+  - port: 8080
+    targetPort: 8080
+    name: http
+    nodePort: 30880  # Port fixe pour accès direct
+  selector:
+    app: billing-dashboard
+  type: NodePort
+
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: billing-dashboard
+  namespace: openstack
+  labels:
+    app: billing-dashboard
+spec:
+  to:
+    kind: Service
+    name: billing-dashboard
+    weight: 100
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None
