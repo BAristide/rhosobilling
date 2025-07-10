@@ -1,0 +1,460 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: billing-api-script
+  namespace: openstack
+data:
+  billing-api.py: |
+    #!/usr/bin/env python3
+    from flask import Flask, jsonify, request
+    from datetime import datetime, timedelta
+    import requests
+    import os
+    import json
+    import base64
+    from kubernetes import client, config
+    from kubernetes.client.rest import ApiException
+    
+    app = Flask(__name__)
+    
+    EXPORTER_URL = os.environ.get('EXPORTER_URL', 'http://billing-exporter:9999/metrics')
+    PRICING_CONFIG_MAP = 'billing-pricing-config'
+    NAMESPACE = 'openstack'
+    
+    # Load Kubernetes config
+    try:
+        config.load_incluster_config()
+        k8s_client = client.CoreV1Api()
+    except:
+        config.load_kube_config()
+        k8s_client = client.CoreV1Api()
+    
+    def get_pricing_config():
+        """Get pricing configuration from ConfigMap"""
+        try:
+            cm = k8s_client.read_namespaced_config_map(
+                name=PRICING_CONFIG_MAP,
+                namespace=NAMESPACE
+            )
+            pricing_data = cm.data.get('pricing.json', '{}')
+            return json.loads(pricing_data)
+        except ApiException as e:
+            app.logger.error(f"Error reading pricing ConfigMap: {e}")
+            return None
+    
+    def update_pricing_config(pricing_data):
+        """Update pricing configuration in ConfigMap"""
+        try:
+            # Get current ConfigMap
+            cm = k8s_client.read_namespaced_config_map(
+                name=PRICING_CONFIG_MAP,
+                namespace=NAMESPACE
+            )
+            
+            # Update pricing data
+            pricing_data['last_updated'] = datetime.now().isoformat() + 'Z'
+            cm.data['pricing.json'] = json.dumps(pricing_data, indent=2)
+            
+            # Update ConfigMap
+            k8s_client.patch_namespaced_config_map(
+                name=PRICING_CONFIG_MAP,
+                namespace=NAMESPACE,
+                body=cm
+            )
+            
+            return True
+        except ApiException as e:
+            app.logger.error(f"Error updating pricing ConfigMap: {e}")
+            return False
+    
+    def parse_prometheus_metrics(text):
+        """Parse Prometheus metrics"""
+        metrics = {}
+        for line in text.split('\n'):
+            if line.startswith('#') or not line.strip():
+                continue
+            
+            parts = line.split('{')
+            if len(parts) >= 2:
+                metric_name = parts[0]
+                label_value = parts[1].split('}')
+                if len(label_value) >= 2:
+                    labels_str = label_value[0]
+                    value = float(label_value[1].strip())
+                    
+                    labels = {}
+                    for pair in labels_str.split(','):
+                        if '=' in pair:
+                            k, v = pair.split('=', 1)
+                            labels[k.strip()] = v.strip('"')
+                    
+                    if metric_name not in metrics:
+                        metrics[metric_name] = []
+                    metrics[metric_name].append({'labels': labels, 'value': value})
+        
+        return metrics
+    
+    def calculate_costs(metrics, pricing):
+        """Calculate costs from metrics"""
+        costs = {}
+        
+        # Process instances
+        for metric in metrics.get('openstack_instance_uptime_hours', []):
+            project = metric['labels'].get('project_name')
+            instance_id = metric['labels'].get('instance_id')
+            
+            if project not in costs:
+                costs[project] = {
+                    'instances': {},
+                    'total_cost': 0,
+                    'resource_usage': {
+                        'vcpus': 0,
+                        'memory_gb': 0,
+                        'disk_gb': 0,
+                        'floating_ips': 0
+                    }
+                }
+            
+            # Get instance resources
+            vcpus = next((m['value'] for m in metrics.get('openstack_instance_vcpus', []) 
+                         if m['labels'].get('instance_id') == instance_id), 0)
+            memory_mb = next((m['value'] for m in metrics.get('openstack_instance_memory_mb', []) 
+                            if m['labels'].get('instance_id') == instance_id), 0)
+            disk_gb = next((m['value'] for m in metrics.get('openstack_instance_disk_gb', []) 
+                          if m['labels'].get('instance_id') == instance_id), 0)
+            
+            memory_gb = memory_mb / 1024
+            uptime = metric['value']
+            
+            # Calculate instance cost
+            instance_cost = (
+                vcpus * uptime * pricing['cpu_per_hour'] +
+                memory_gb * uptime * pricing['memory_gb_per_hour'] +
+                disk_gb * uptime * pricing['disk_gb_per_hour']
+            )
+            
+            costs[project]['instances'][instance_id] = {
+                'name': metric['labels'].get('instance_name'),
+                'vcpus': vcpus,
+                'memory_gb': memory_gb,
+                'disk_gb': disk_gb,
+                'uptime_hours': uptime,
+                'cost': round(instance_cost, 2)
+            }
+            
+            costs[project]['resource_usage']['vcpus'] += vcpus
+            costs[project]['resource_usage']['memory_gb'] += memory_gb
+            costs[project]['resource_usage']['disk_gb'] += disk_gb
+            costs[project]['total_cost'] += instance_cost
+        
+        # Add floating IP costs
+        for metric in metrics.get('openstack_floating_ip_count', []):
+            project = metric['labels'].get('project_name')
+            if project in costs:
+                count = metric['value']
+                costs[project]['resource_usage']['floating_ips'] = count
+                # Assume 24h for daily cost
+                costs[project]['total_cost'] += count * 24 * pricing['floating_ip_per_hour']
+        
+        # Round total costs
+        for project in costs:
+            costs[project]['total_cost'] = round(costs[project]['total_cost'], 2)
+        
+        return costs
+    
+    @app.route('/health')
+    def health():
+        """Health check endpoint"""
+        return jsonify({'status': 'healthy'})
+    
+    @app.route('/api/v1/costs')
+    def get_costs():
+        """Get current costs for all projects"""
+        try:
+            # Get pricing configuration
+            config = get_pricing_config()
+            if not config:
+                return jsonify({
+                    'status': 'error',
+                    'message': 'Could not load pricing configuration'
+                }), 500
+            
+            pricing = config.get('pricing', {})
+            
+            # Get metrics
+            response = requests.get(EXPORTER_URL)
+            metrics = parse_prometheus_metrics(response.text)
+            costs = calculate_costs(metrics, pricing)
+            
+            return jsonify({
+                'status': 'success',
+                'timestamp': datetime.now().isoformat(),
+                'costs': costs,
+                'pricing_version': config.get('version', 'unknown')
+            })
+        except Exception as e:
+            return jsonify({
+                'status': 'error',
+                'message': str(e)
+            }), 500
+    
+    @app.route('/api/v1/costs/<project>')
+    def get_project_costs(project):
+        """Get costs for a specific project"""
+        try:
+            # Get pricing configuration
+            config = get_pricing_config()
+            if not config:
+                return jsonify({
+                    'status': 'error',
+                    'message': 'Could not load pricing configuration'
+                }), 500
+            
+            pricing = config.get('pricing', {})
+            
+            # Get metrics
+            response = requests.get(EXPORTER_URL)
+            metrics = parse_prometheus_metrics(response.text)
+            costs = calculate_costs(metrics, pricing)
+            
+            if project not in costs:
+                return jsonify({
+                    'status': 'error',
+                    'message': f'Project {project} not found'
+                }), 404
+            
+            return jsonify({
+                'status': 'success',
+                'timestamp': datetime.now().isoformat(),
+                'project': project,
+                'costs': costs[project],
+                'pricing_version': config.get('version', 'unknown')
+            })
+        except Exception as e:
+            return jsonify({
+                'status': 'error',
+                'message': str(e)
+            }), 500
+    
+    @app.route('/api/v1/pricing')
+    def get_pricing():
+        """Get current pricing configuration"""
+        config = get_pricing_config()
+        if not config:
+            return jsonify({
+                'status': 'error',
+                'message': 'Could not load pricing configuration'
+            }), 500
+        
+        return jsonify({
+            'status': 'success',
+            'pricing': config.get('pricing', {}),
+            'currency': config.get('currency', 'EUR'),
+            'version': config.get('version', 'unknown'),
+            'last_updated': config.get('last_updated', 'unknown'),
+            'updated_by': config.get('updated_by', 'unknown')
+        })
+    
+    @app.route('/api/v1/pricing', methods=['PUT'])
+    def update_pricing():
+        """Update pricing configuration"""
+        # Check authorization header
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({
+                'status': 'error',
+                'message': 'Authorization required'
+            }), 401
+        
+        # Validate request data
+        try:
+            data = request.get_json()
+            if not data or 'pricing' not in data:
+                return jsonify({
+                    'status': 'error',
+                    'message': 'Invalid request data'
+                }), 400
+            
+            # Validate pricing fields
+            required_fields = ['cpu_per_hour', 'memory_gb_per_hour', 'disk_gb_per_hour', 
+                             'floating_ip_per_hour']
+            pricing = data['pricing']
+            
+            for field in required_fields:
+                if field not in pricing:
+                    return jsonify({
+                        'status': 'error',
+                        'message': f'Missing required field: {field}'
+                    }), 400
+                
+                # Validate that values are positive numbers
+                try:
+                    value = float(pricing[field])
+                    if value < 0:
+                        return jsonify({
+                            'status': 'error',
+                            'message': f'Invalid value for {field}: must be positive'
+                        }), 400
+                except ValueError:
+                    return jsonify({
+                        'status': 'error',
+                        'message': f'Invalid value for {field}: must be a number'
+                    }), 400
+            
+            # Get current config
+            current_config = get_pricing_config()
+            if not current_config:
+                current_config = {
+                    'version': '1.0',
+                    'currency': 'EUR',
+                    'metadata': {}
+                }
+            
+            # Update config
+            current_config['pricing'] = pricing
+            current_config['updated_by'] = data.get('updated_by', 'api')
+            
+            # Save to ConfigMap
+            if update_pricing_config(current_config):
+                return jsonify({
+                    'status': 'success',
+                    'message': 'Pricing updated successfully',
+                    'pricing': pricing
+                })
+            else:
+                return jsonify({
+                    'status': 'error',
+                    'message': 'Failed to update pricing configuration'
+                }), 500
+                
+        except Exception as e:
+            return jsonify({
+                'status': 'error',
+                'message': str(e)
+            }), 500
+    
+    @app.route('/api/v1/summary')
+    def get_summary():
+        """Get billing summary"""
+        try:
+            # Get pricing configuration
+            config = get_pricing_config()
+            if not config:
+                return jsonify({
+                    'status': 'error',
+                    'message': 'Could not load pricing configuration'
+                }), 500
+            
+            pricing = config.get('pricing', {})
+            
+            # Get metrics
+            response = requests.get(EXPORTER_URL)
+            metrics = parse_prometheus_metrics(response.text)
+            costs = calculate_costs(metrics, pricing)
+            
+            total_cost = sum(p['total_cost'] for p in costs.values())
+            total_instances = sum(len(p['instances']) for p in costs.values())
+            
+            return jsonify({
+                'status': 'success',
+                'timestamp': datetime.now().isoformat(),
+                'summary': {
+                    'total_projects': len(costs),
+                    'total_instances': total_instances,
+                    'total_daily_cost': round(total_cost, 2),
+                    'total_monthly_projected': round(total_cost * 30, 2),
+                    'currency': config.get('currency', 'EUR')
+                },
+                'pricing_version': config.get('version', 'unknown'),
+                'pricing_last_updated': config.get('last_updated', 'unknown')
+            })
+        except Exception as e:
+            return jsonify({
+                'status': 'error',
+                'message': str(e)
+            }), 500
+    
+    if __name__ == '__main__':
+        app.run(host='0.0.0.0', port=8080)
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: billing-api
+  namespace: openstack
+  labels:
+    app: billing-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: billing-api
+  template:
+    metadata:
+      labels:
+        app: billing-api
+    spec:
+      serviceAccountName: billing-pricing-updater
+      containers:
+      - name: api
+        image: python:3.9-slim
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            # Configurer l'environnement pour installer les packages dans /tmp
+            export PYTHONUSERBASE=/tmp/python-packages
+            export PATH=$PYTHONUSERBASE/bin:$PATH
+            mkdir -p $PYTHONUSERBASE
+            
+            # Installer les packages
+            pip install --user flask requests kubernetes
+            
+            # Démarrer l'API
+            python /scripts/billing-api.py
+        ports:
+        - containerPort: 8080
+          name: http
+        env:
+        - name: EXPORTER_URL
+          value: "http://billing-exporter:9999/metrics"
+        volumeMounts:
+        - name: script
+          mountPath: /scripts
+      volumes:
+      - name: script
+        configMap:
+          name: billing-api-script
+          defaultMode: 0755
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: billing-api
+  namespace: openstack
+  labels:
+    app: billing-api
+spec:
+  ports:
+  - port: 8080
+    targetPort: 8080
+    name: http
+  selector:
+    app: billing-api
+
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: billing-api
+  namespace: openstack
+spec:
+  to:
+    kind: Service
+    name: billing-api
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
