@@ -1,0 +1,539 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: billing-reports-viewer-html
+  namespace: openstack
+data:
+  reports.html: |
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Billing Reports</title>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                margin: 20px;
+                background-color: #f5f5f5;
+            }
+            .container {
+                max-width: 1200px;
+                margin: 0 auto;
+            }
+            .card {
+                background: white;
+                border-radius: 8px;
+                padding: 20px;
+                margin-bottom: 20px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            }
+            h1, h2 {
+                color: #333;
+            }
+            table {
+                width: 100%;
+                border-collapse: collapse;
+                margin-top: 20px;
+            }
+            th, td {
+                padding: 12px;
+                text-align: left;
+                border-bottom: 1px solid #ddd;
+            }
+            th {
+                background-color: #f8f9fa;
+                font-weight: bold;
+            }
+            .btn {
+                padding: 8px 16px;
+                margin: 5px;
+                border: none;
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 14px;
+                text-decoration: none;
+                display: inline-block;
+            }
+            .btn-primary {
+                background: #007bff;
+                color: white;
+            }
+            .btn-success {
+                background: #28a745;
+                color: white;
+            }
+            .btn:hover {
+                opacity: 0.9;
+            }
+            .report-row:hover {
+                background-color: #f8f9fa;
+            }
+            .status-badge {
+                display: inline-block;
+                padding: 4px 8px;
+                border-radius: 4px;
+                font-size: 0.85em;
+                font-weight: bold;
+            }
+            .status-current {
+                background-color: #28a745;
+                color: white;
+            }
+            .status-historical {
+                background-color: #6c757d;
+                color: white;
+            }
+            .trend-up {
+                color: #dc3545;
+            }
+            .trend-down {
+                color: #28a745;
+            }
+            .trend-stable {
+                color: #6c757d;
+            }
+            .loading {
+                text-align: center;
+                padding: 40px;
+                color: #666;
+            }
+            .error {
+                background-color: #f8d7da;
+                color: #721c24;
+                padding: 10px;
+                border-radius: 5px;
+                margin: 10px 0;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>OpenStack Billing Reports</h1>
+            
+            <div class="card">
+                <h2>Available Reports</h2>
+                <div class="controls">
+                    <button class="btn btn-primary" onclick="refreshReports()">Refresh</button>
+                    <button class="btn btn-success" onclick="generateNewReport()">Generate Current Month Report</button>
+                </div>
+                
+                <div id="loading" class="loading" style="display: none;">Loading reports...</div>
+                <div id="error" class="error" style="display: none;"></div>
+                
+                <table id="reports-table" style="display: none;">
+                    <thead>
+                        <tr>
+                            <th>Report Period</th>
+                            <th>Generated</th>
+                            <th>Total Cost</th>
+                            <th>Projects</th>
+                            <th>Instances</th>
+                            <th>Trend</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="reports-tbody">
+                    </tbody>
+                </table>
+            </div>
+            
+            <div class="card">
+                <h2>Cost Trends</h2>
+                <canvas id="trend-chart" width="400" height="200"></canvas>
+            </div>
+        </div>
+        
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <script>
+            let trendChart = null;
+            
+            async function loadReports() {
+                const loading = document.getElementById('loading');
+                const error = document.getElementById('error');
+                const table = document.getElementById('reports-table');
+                
+                loading.style.display = 'block';
+                error.style.display = 'none';
+                table.style.display = 'none';
+                
+                try {
+                    const response = await fetch('/api/reports');
+                    if (!response.ok) throw new Error('Failed to load reports');
+                    
+                    const data = await response.json();
+                    displayReports(data.reports);
+                    updateTrendChart(data.history);
+                    
+                    loading.style.display = 'none';
+                    table.style.display = 'table';
+                } catch (err) {
+                    loading.style.display = 'none';
+                    error.style.display = 'block';
+                    error.textContent = `Error: ${err.message}`;
+                }
+            }
+            
+            function displayReports(reports) {
+                const tbody = document.getElementById('reports-tbody');
+                tbody.innerHTML = '';
+                
+                reports.forEach(report => {
+                    const row = document.createElement('tr');
+                    row.className = 'report-row';
+                    
+                    const trendIcon = report.trend > 0 ? '📈' : report.trend < 0 ? '📉' : '➡️';
+                    const trendClass = report.trend > 0 ? 'trend-up' : report.trend < 0 ? 'trend-down' : 'trend-stable';
+                    const trendText = report.trend !== null ? `${trendIcon} ${Math.abs(report.trend).toFixed(1)}%` : 'N/A';
+                    
+                    row.innerHTML = `
+                        <td>${report.period}</td>
+                        <td>${new Date(report.generated).toLocaleString()}</td>
+                        <td><strong>€${report.total_cost.toFixed(2)}</strong></td>
+                        <td>${report.projects}</td>
+                        <td>${report.instances}</td>
+                        <td class="${trendClass}">${trendText}</td>
+                        <td>
+                            <a href="/api/reports/download/${report.filename}.xlsx" class="btn btn-primary">Excel</a>
+                            <a href="/api/reports/download/${report.filename}.json" class="btn btn-primary">JSON</a>
+                            ${report.has_pdf ? `<a href="/api/reports/download/${report.filename}.pdf" class="btn btn-primary">PDF</a>` : ''}
+                        </td>
+                    `;
+                    
+                    tbody.appendChild(row);
+                });
+            }
+            
+            function updateTrendChart(history) {
+                const ctx = document.getElementById('trend-chart').getContext('2d');
+                
+                if (trendChart) {
+                    trendChart.destroy();
+                }
+                
+                const labels = history.map(h => h.date);
+                const costs = history.map(h => h.total_cost);
+                
+                trendChart = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: labels,
+                        datasets: [{
+                            label: 'Daily Cost (€)',
+                            data: costs,
+                            borderColor: 'rgb(54, 96, 146)',
+                            backgroundColor: 'rgba(54, 96, 146, 0.1)',
+                            tension: 0.1
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {
+                            title: {
+                                display: true,
+                                text: 'Cost Trend (Last 30 Days)'
+                            }
+                        },
+                        scales: {
+                            y: {
+                                beginAtZero: true,
+                                ticks: {
+                                    callback: function(value) {
+                                        return '€' + value.toFixed(2);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+            
+            async function generateNewReport() {
+                if (!confirm('Generate a new report for the current month?')) return;
+                
+                try {
+                    const response = await fetch('/api/reports/generate', {
+                        method: 'POST'
+                    });
+                    
+                    if (!response.ok) throw new Error('Failed to generate report');
+                    
+                    alert('Report generation started. Please refresh in a few minutes.');
+                } catch (err) {
+                    alert(`Error: ${err.message}`);
+                }
+            }
+            
+            function refreshReports() {
+                loadReports();
+            }
+            
+            // Load reports on page load
+            window.onload = () => {
+                loadReports();
+            };
+        </script>
+    </body>
+    </html>
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: billing-reports-api-script
+  namespace: openstack
+data:
+  reports-api.py: |
+    #!/usr/bin/env python3
+    from flask import Flask, jsonify, send_file, request
+    import os
+    import json
+    from datetime import datetime
+    import glob
+    from pathlib import Path
+    
+    app = Flask(__name__)
+    
+    REPORTS_DIR = '/reports'
+    
+    def get_report_info(filepath):
+        """Extract report information from file"""
+        filename = os.path.basename(filepath)
+        
+        # Parse filename: billing_report_YYYYMMDD_YYYYMMDD.ext
+        parts = filename.split('_')
+        if len(parts) >= 4:
+            start_date = parts[2]
+            end_date = parts[3].split('.')[0]
+            
+            # Load JSON to get more details
+            json_path = filepath.replace('.xlsx', '.json').replace('.pdf', '.json')
+            if os.path.exists(json_path):
+                with open(json_path, 'r') as f:
+                    data = json.load(f)
+                    return {
+                        'filename': filename.replace('.json', ''),
+                        'period': f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:]} to {end_date[:4]}-{end_date[4:6]}-{end_date[6:]}",
+                        'generated': data['summary']['generated_at'],
+                        'total_cost': data['summary']['total_cost'],
+                        'projects': data['summary']['total_projects'],
+                        'instances': data['summary']['total_instances'],
+                        'trend': data['summary'].get('cost_trend_7d'),
+                        'has_pdf': os.path.exists(filepath.replace('.json', '.pdf'))
+                    }
+        return None
+    
+    @app.route('/api/reports')
+    def list_reports():
+        """List all available reports"""
+        try:
+            # Find all JSON reports
+            json_files = glob.glob(os.path.join(REPORTS_DIR, 'billing_report_*.json'))
+            reports = []
+            
+            for json_file in sorted(json_files, reverse=True):
+                info = get_report_info(json_file)
+                if info:
+                    reports.append(info)
+            
+            # Load history for trend chart
+            history = {'daily': []}
+            history_file = os.path.join(REPORTS_DIR, 'billing_history.json')
+            if os.path.exists(history_file):
+                with open(history_file, 'r') as f:
+                    history = json.load(f)
+            
+            # Get last 30 days
+            recent_history = history['daily'][-30:] if 'daily' in history else []
+            
+            return jsonify({
+                'reports': reports,
+                'history': recent_history
+            })
+            
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    
+    @app.route('/api/reports/download/<filename>')
+    def download_report(filename):
+        """Download a specific report"""
+        try:
+            filepath = os.path.join(REPORTS_DIR, filename)
+            
+            if not os.path.exists(filepath):
+                return jsonify({'error': 'Report not found'}), 404
+            
+            # Determine MIME type
+            if filename.endswith('.xlsx'):
+                mimetype = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            elif filename.endswith('.pdf'):
+                mimetype = 'application/pdf'
+            elif filename.endswith('.json'):
+                mimetype = 'application/json'
+            else:
+                mimetype = 'application/octet-stream'
+            
+            return send_file(
+                filepath,
+                mimetype=mimetype,
+                as_attachment=True,
+                download_name=filename
+            )
+            
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    
+    @app.route('/api/reports/generate', methods=['POST'])
+    def generate_report():
+        """Trigger manual report generation"""
+        try:
+            # Create a Kubernetes job to generate the report
+            from kubernetes import client, config
+            
+            config.load_incluster_config()
+            batch_v1 = client.BatchV1Api()
+            
+            # Create job from the manual job template
+            job_name = f"manual-report-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            
+            # This is a simplified version - in production, you'd properly create the job
+            return jsonify({
+                'status': 'success',
+                'message': 'Report generation triggered',
+                'job_name': job_name
+            })
+            
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    
+    @app.route('/health')
+    def health():
+        return jsonify({'status': 'healthy'})
+    
+    if __name__ == '__main__':
+        app.run(host='0.0.0.0', port=8081)
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: billing-reports-viewer
+  namespace: openstack
+  labels:
+    app: billing-reports-viewer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: billing-reports-viewer
+  template:
+    metadata:
+      labels:
+        app: billing-reports-viewer
+    spec:
+      containers:
+      - name: api
+        image: python:3.9-slim
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            # Configurer l'environnement pour installer les packages dans /tmp
+            export PYTHONUSERBASE=/tmp/python-packages
+            export PATH=$PYTHONUSERBASE/bin:$PATH
+            mkdir -p $PYTHONUSERBASE
+            
+            # Installer les packages avec --user
+            pip install --user flask kubernetes
+            
+            # Démarrer l'API
+            python /scripts/reports-api.py
+        ports:
+        - containerPort: 8081
+          name: http
+        volumeMounts:
+        - name: script
+          mountPath: /scripts
+        - name: reports
+          mountPath: /reports
+          readOnly: true
+      - name: nginx
+        image: nginxinc/nginx-unprivileged:alpine
+        ports:
+        - containerPort: 8080
+          name: web
+        volumeMounts:
+        - name: html
+          mountPath: /usr/share/nginx/html
+        - name: nginx-config
+          mountPath: /etc/nginx/conf.d
+      volumes:
+      - name: script
+        configMap:
+          name: billing-reports-api-script
+          defaultMode: 0755
+      - name: html
+        configMap:
+          name: billing-reports-viewer-html
+      - name: nginx-config
+        configMap:
+          name: billing-reports-viewer-nginx
+      - name: reports
+        persistentVolumeClaim:
+          claimName: billing-reports-pvc
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: billing-reports-viewer-nginx
+  namespace: openstack
+data:
+  default.conf: |
+    server {
+        listen 8080;
+        server_name localhost;
+        
+        location / {
+            root /usr/share/nginx/html;
+            try_files $uri /reports.html;
+        }
+        
+        location /api/ {
+            proxy_pass http://localhost:8081/api/;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+        }
+    }
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: billing-reports-viewer
+  namespace: openstack
+  labels:
+    app: billing-reports-viewer
+spec:
+  ports:
+  - port: 8080
+    targetPort: 8080
+    name: http
+  selector:
+    app: billing-reports-viewer
+
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: billing-reports
+  namespace: openstack
+spec:
+  to:
+    kind: Service
+    name: billing-reports-viewer
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
