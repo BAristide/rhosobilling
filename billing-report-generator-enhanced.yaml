@@ -1,0 +1,810 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: billing-report-script
+  namespace: openstack
+data:
+  generate-report.py: |
+    #!/usr/bin/env python3
+    import os
+    import sys
+    import json
+    import requests
+    from datetime import datetime, timedelta
+    import pandas as pd
+    from openpyxl import Workbook, load_workbook
+    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+    from openpyxl.utils import get_column_letter
+    from openpyxl.chart import BarChart, PieChart, LineChart, Reference
+    from openpyxl.chart.axis import DateAxis
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+    from io import BytesIO
+    import base64
+    
+    # Configuration
+    EXPORTER_URL = os.environ.get('EXPORTER_URL', 'http://billing-exporter:9999/metrics')
+    API_URL = os.environ.get('API_URL', 'http://billing-api:8080/api/v1')
+    REPORT_DIR = '/reports'
+    HISTORY_FILE = '/reports/billing_history.json'
+    
+    def load_pricing_config():
+        """Load current pricing from API"""
+        try:
+            response = requests.get(f"{API_URL}/pricing")
+            if response.status_code == 200:
+                data = response.json()
+                return data.get('pricing', {})
+        except Exception as e:
+            print(f"Error loading pricing from API: {e}")
+        
+        # Fallback to default pricing
+        return {
+            'cpu_per_hour': 0.05,
+            'memory_gb_per_hour': 0.01,
+            'disk_gb_per_hour': 0.000137,
+            'volume_gb_per_hour': 0.00011,
+            'floating_ip_per_hour': 0.0069,
+            'network_gb': 0.10
+        }
+    
+    def load_history():
+        """Load historical billing data"""
+        if os.path.exists(HISTORY_FILE):
+            try:
+                with open(HISTORY_FILE, 'r') as f:
+                    return json.load(f)
+            except:
+                return {'daily': []}
+        return {'daily': []}
+    
+    def save_history(history):
+        """Save historical billing data"""
+        with open(HISTORY_FILE, 'w') as f:
+            json.dump(history, f, indent=2)
+    
+    def parse_prometheus_metrics(text):
+        """Parse Prometheus metrics format"""
+        metrics = {}
+        lines = text.split('\n')
+        
+        for line in lines:
+            if line.startswith('#') or not line.strip():
+                continue
+                
+            parts = line.split('{')
+            if len(parts) >= 2:
+                metric_name = parts[0]
+                
+                # Extract labels and value
+                label_value_parts = parts[1].split('}')
+                if len(label_value_parts) >= 2:
+                    labels_str = label_value_parts[0]
+                    value_str = label_value_parts[1].strip()
+                    
+                    # Parse labels
+                    labels = {}
+                    for label_pair in labels_str.split(','):
+                        if '=' in label_pair:
+                            key, val = label_pair.split('=', 1)
+                            labels[key.strip()] = val.strip('"')
+                    
+                    # Parse value
+                    try:
+                        value = float(value_str)
+                        if metric_name not in metrics:
+                            metrics[metric_name] = []
+                        metrics[metric_name].append({'labels': labels, 'value': value})
+                    except ValueError:
+                        continue
+                        
+        return metrics
+    
+    def fetch_metrics():
+        """Fetch metrics from the exporter"""
+        try:
+            response = requests.get(EXPORTER_URL, timeout=30)
+            response.raise_for_status()
+            return parse_prometheus_metrics(response.text)
+        except Exception as e:
+            print(f"Error fetching metrics: {e}")
+            return None
+    
+    def calculate_trend(current, history, days=7):
+        """Calculate trend based on historical data"""
+        if not history or len(history) < days:
+            return 0
+        
+        recent_avg = sum(h.get('total_cost', 0) for h in history[-days:]) / days
+        if recent_avg == 0:
+            return 0
+        
+        return ((current - recent_avg) / recent_avg) * 100
+    
+    def generate_billing_report(metrics, start_date, end_date, pricing):
+        """Generate enhanced billing report from metrics"""
+        report_data = {
+            'summary': {
+                'period': f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}",
+                'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'total_cost': 0,
+                'total_instances': 0,
+                'total_projects': 0,
+                'avg_cost_per_instance': 0,
+                'avg_cost_per_project': 0,
+                'most_expensive_project': None,
+                'most_expensive_instance': None,
+                'pricing_version': pricing
+            },
+            'projects': {},
+            'instances': [],
+            'daily_breakdown': {},
+            'resource_utilization': {
+                'total_vcpus': 0,
+                'total_memory_gb': 0,
+                'total_disk_gb': 0,
+                'total_floating_ips': 0
+            },
+            'cost_breakdown': {
+                'compute_cost': 0,
+                'memory_cost': 0,
+                'storage_cost': 0,
+                'network_cost': 0
+            }
+        }
+        
+        if not metrics:
+            return report_data
+            
+        # Process instance metrics
+        instance_data = {}
+        
+        # Gather instance uptime
+        for metric in metrics.get('openstack_instance_uptime_hours', []):
+            instance_id = metric['labels'].get('instance_id')
+            instance_data[instance_id] = {
+                'name': metric['labels'].get('instance_name'),
+                'project_id': metric['labels'].get('project_id'),
+                'project_name': metric['labels'].get('project_name'),
+                'flavor': metric['labels'].get('flavor'),
+                'zone': metric['labels'].get('availability_zone'),
+                'uptime_hours': metric['value']
+            }
+        
+        # Add resource metrics
+        for metric in metrics.get('openstack_instance_vcpus', []):
+            instance_id = metric['labels'].get('instance_id')
+            if instance_id in instance_data:
+                instance_data[instance_id]['vcpus'] = metric['value']
+                
+        for metric in metrics.get('openstack_instance_memory_mb', []):
+            instance_id = metric['labels'].get('instance_id')
+            if instance_id in instance_data:
+                instance_data[instance_id]['memory_gb'] = metric['value'] / 1024
+                
+        for metric in metrics.get('openstack_instance_disk_gb', []):
+            instance_id = metric['labels'].get('instance_id')
+            if instance_id in instance_data:
+                instance_data[instance_id]['disk_gb'] = metric['value']
+        
+        # Calculate costs and statistics
+        max_instance_cost = 0
+        max_instance_name = None
+        
+        for instance_id, data in instance_data.items():
+            vcpus = data.get('vcpus', 0)
+            memory_gb = data.get('memory_gb', 0)
+            disk_gb = data.get('disk_gb', 0)
+            uptime = data.get('uptime_hours', 0)
+            
+            # Calculate costs
+            cpu_cost = vcpus * uptime * pricing['cpu_per_hour']
+            memory_cost = memory_gb * uptime * pricing['memory_gb_per_hour']
+            disk_cost = disk_gb * uptime * pricing['disk_gb_per_hour']
+            total_cost = cpu_cost + memory_cost + disk_cost
+            
+            # Update cost breakdown
+            report_data['cost_breakdown']['compute_cost'] += cpu_cost
+            report_data['cost_breakdown']['memory_cost'] += memory_cost
+            report_data['cost_breakdown']['storage_cost'] += disk_cost
+            
+            # Update resource utilization
+            report_data['resource_utilization']['total_vcpus'] += vcpus
+            report_data['resource_utilization']['total_memory_gb'] += memory_gb
+            report_data['resource_utilization']['total_disk_gb'] += disk_gb
+            
+            # Track most expensive instance
+            if total_cost > max_instance_cost:
+                max_instance_cost = total_cost
+                max_instance_name = data['name']
+            
+            instance_report = {
+                'instance_id': instance_id,
+                'instance_name': data['name'],
+                'project_name': data['project_name'],
+                'zone': data['zone'],
+                'flavor': data['flavor'],
+                'vcpus': vcpus,
+                'memory_gb': memory_gb,
+                'disk_gb': disk_gb,
+                'uptime_hours': round(uptime, 2),
+                'cpu_cost': round(cpu_cost, 2),
+                'memory_cost': round(memory_cost, 2),
+                'disk_cost': round(disk_cost, 2),
+                'total_cost': round(total_cost, 2),
+                'cost_per_hour': round(total_cost / uptime if uptime > 0 else 0, 4)
+            }
+            
+            report_data['instances'].append(instance_report)
+            
+            # Aggregate by project
+            project_name = data['project_name']
+            if project_name not in report_data['projects']:
+                report_data['projects'][project_name] = {
+                    'instances': 0,
+                    'total_vcpus': 0,
+                    'total_memory_gb': 0,
+                    'total_disk_gb': 0,
+                    'total_cost': 0,
+                    'floating_ips': 0,
+                    'instances_list': []
+                }
+            
+            report_data['projects'][project_name]['instances'] += 1
+            report_data['projects'][project_name]['total_vcpus'] += vcpus
+            report_data['projects'][project_name]['total_memory_gb'] += memory_gb
+            report_data['projects'][project_name]['total_disk_gb'] += disk_gb
+            report_data['projects'][project_name]['total_cost'] += total_cost
+            report_data['projects'][project_name]['instances_list'].append(instance_report)
+        
+        # Add floating IP costs
+        for metric in metrics.get('openstack_floating_ip_count', []):
+            project_name = metric['labels'].get('project_name')
+            count = metric['value']
+            
+            if project_name not in report_data['projects']:
+                report_data['projects'][project_name] = {
+                    'instances': 0,
+                    'total_vcpus': 0,
+                    'total_memory_gb': 0,
+                    'total_disk_gb': 0,
+                    'total_cost': 0,
+                    'floating_ips': 0,
+                    'instances_list': []
+                }
+            
+            report_data['projects'][project_name]['floating_ips'] = count
+            report_data['resource_utilization']['total_floating_ips'] += count
+            
+            # Assume floating IPs for the whole period
+            hours = (end_date - start_date).total_seconds() / 3600
+            floating_ip_cost = count * hours * pricing['floating_ip_per_hour']
+            report_data['projects'][project_name]['total_cost'] += floating_ip_cost
+            report_data['cost_breakdown']['network_cost'] += floating_ip_cost
+        
+        # Calculate totals and find most expensive project
+        max_project_cost = 0
+        max_project_name = None
+        
+        for project_name, project_data in report_data['projects'].items():
+            if project_data['total_cost'] > max_project_cost:
+                max_project_cost = project_data['total_cost']
+                max_project_name = project_name
+        
+        # Update summary
+        report_data['summary']['total_cost'] = sum(
+            project['total_cost'] for project in report_data['projects'].values()
+        )
+        report_data['summary']['total_instances'] = len(report_data['instances'])
+        report_data['summary']['total_projects'] = len(report_data['projects'])
+        
+        if report_data['summary']['total_instances'] > 0:
+            report_data['summary']['avg_cost_per_instance'] = round(
+                report_data['summary']['total_cost'] / report_data['summary']['total_instances'], 2
+            )
+        
+        if report_data['summary']['total_projects'] > 0:
+            report_data['summary']['avg_cost_per_project'] = round(
+                report_data['summary']['total_cost'] / report_data['summary']['total_projects'], 2
+            )
+        
+        report_data['summary']['most_expensive_project'] = max_project_name
+        report_data['summary']['most_expensive_instance'] = max_instance_name
+        
+        # Round all costs
+        for key in report_data['cost_breakdown']:
+            report_data['cost_breakdown'][key] = round(report_data['cost_breakdown'][key], 2)
+        
+        return report_data
+    
+    def generate_excel_report(report_data, filename):
+        """Generate enhanced Excel report with charts"""
+        wb = Workbook()
+        
+        # Styles
+        header_font = Font(bold=True, size=14, color="FFFFFF")
+        header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+        title_font = Font(bold=True, size=18)
+        subtitle_font = Font(size=12, italic=True)
+        currency_format = '#,##0.00 €'
+        percent_format = '0.0%'
+        border = Border(
+            left=Side(style='thin'),
+            right=Side(style='thin'),
+            top=Side(style='thin'),
+            bottom=Side(style='thin')
+        )
+        
+        # 1. Executive Summary Sheet
+        ws_summary = wb.active
+        ws_summary.title = "Executive Summary"
+        
+        # Title
+        ws_summary['A1'] = "OpenStack Billing Report - Executive Summary"
+        ws_summary['A1'].font = title_font
+        ws_summary.merge_cells('A1:G1')
+        
+        ws_summary['A2'] = f"Period: {report_data['summary']['period']}"
+        ws_summary['A2'].font = subtitle_font
+        
+        ws_summary['A3'] = f"Generated: {report_data['summary']['generated_at']}"
+        ws_summary['A3'].font = subtitle_font
+        
+        # Key Metrics
+        ws_summary['A5'] = "Key Metrics"
+        ws_summary['A5'].font = Font(bold=True, size=16)
+        
+        metrics = [
+            ("Total Cost", report_data['summary']['total_cost'], currency_format),
+            ("Total Projects", report_data['summary']['total_projects'], "0"),
+            ("Total Instances", report_data['summary']['total_instances'], "0"),
+            ("Average Cost per Instance", report_data['summary']['avg_cost_per_instance'], currency_format),
+            ("Average Cost per Project", report_data['summary']['avg_cost_per_project'], currency_format),
+            ("Most Expensive Project", report_data['summary']['most_expensive_project'] or "N/A", "@"),
+            ("Most Expensive Instance", report_data['summary']['most_expensive_instance'] or "N/A", "@")
+        ]
+        
+        row = 7
+        for metric_name, metric_value, format_str in metrics:
+            ws_summary[f'A{row}'] = metric_name
+            ws_summary[f'A{row}'].font = Font(bold=True)
+            ws_summary[f'C{row}'] = metric_value
+            if format_str != "@":
+                ws_summary[f'C{row}'].number_format = format_str
+            row += 1
+        
+        # Cost Breakdown
+        ws_summary['E5'] = "Cost Breakdown"
+        ws_summary['E5'].font = Font(bold=True, size=16)
+        
+        row = 7
+        total_cost = report_data['summary']['total_cost']
+        for cost_type, cost_value in report_data['cost_breakdown'].items():
+            ws_summary[f'E{row}'] = cost_type.replace('_', ' ').title()
+            ws_summary[f'G{row}'] = cost_value
+            ws_summary[f'G{row}'].number_format = currency_format
+            ws_summary[f'H{row}'] = cost_value / total_cost if total_cost > 0 else 0
+            ws_summary[f'H{row}'].number_format = percent_format
+            row += 1
+        
+        # 2. Project Summary Sheet
+        ws_projects = wb.create_sheet("Project Summary")
+        
+        # Headers
+        headers = ['Project', 'Instances', 'vCPUs', 'Memory (GB)', 'Disk (GB)', 'Floating IPs', 'Total Cost (€)', '% of Total']
+        for col, header in enumerate(headers, 1):
+            cell = ws_projects.cell(row=1, column=col, value=header)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal='center')
+            cell.border = border
+        
+        # Data
+        row = 2
+        for project_name, project_data in sorted(report_data['projects'].items(), 
+                                                 key=lambda x: x[1]['total_cost'], reverse=True):
+            ws_projects.cell(row=row, column=1, value=project_name).border = border
+            ws_projects.cell(row=row, column=2, value=project_data['instances']).border = border
+            ws_projects.cell(row=row, column=3, value=project_data['total_vcpus']).border = border
+            ws_projects.cell(row=row, column=4, value=round(project_data['total_memory_gb'], 2)).border = border
+            ws_projects.cell(row=row, column=5, value=project_data['total_disk_gb']).border = border
+            ws_projects.cell(row=row, column=6, value=project_data['floating_ips']).border = border
+            cell = ws_projects.cell(row=row, column=7, value=project_data['total_cost'])
+            cell.number_format = currency_format
+            cell.border = border
+            pct = project_data['total_cost'] / total_cost if total_cost > 0 else 0
+            cell = ws_projects.cell(row=row, column=8, value=pct)
+            cell.number_format = percent_format
+            cell.border = border
+            row += 1
+        
+        # Add chart for project costs
+        if len(report_data['projects']) > 0:
+            chart = BarChart()
+            chart.title = "Project Costs"
+            chart.style = 10
+            chart.y_axis.title = 'Cost (€)'
+            chart.x_axis.title = 'Project'
+            
+            data = Reference(ws_projects, min_col=7, min_row=1, max_row=row-1)
+            cats = Reference(ws_projects, min_col=1, min_row=2, max_row=row-1)
+            chart.add_data(data, titles_from_data=True)
+            chart.set_categories(cats)
+            ws_projects.add_chart(chart, "J2")
+        
+        # 3. Instance Details Sheet
+        ws_instances = wb.create_sheet("Instance Details")
+        
+        # Headers
+        instance_headers = ['Instance Name', 'Project', 'Zone', 'Flavor', 'vCPUs', 'Memory (GB)', 
+                           'Disk (GB)', 'Uptime (hours)', 'CPU Cost (€)', 'Memory Cost (€)', 
+                           'Disk Cost (€)', 'Total Cost (€)', 'Cost/Hour (€)']
+        
+        for col, header in enumerate(instance_headers, 1):
+            cell = ws_instances.cell(row=1, column=col, value=header)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal='center')
+            cell.border = border
+        
+        # Data - sorted by cost
+        sorted_instances = sorted(report_data['instances'], key=lambda x: x['total_cost'], reverse=True)
+        for idx, instance in enumerate(sorted_instances, 2):
+            ws_instances.cell(row=idx, column=1, value=instance['instance_name']).border = border
+            ws_instances.cell(row=idx, column=2, value=instance['project_name']).border = border
+            ws_instances.cell(row=idx, column=3, value=instance['zone']).border = border
+            ws_instances.cell(row=idx, column=4, value=instance['flavor']).border = border
+            ws_instances.cell(row=idx, column=5, value=instance['vcpus']).border = border
+            ws_instances.cell(row=idx, column=6, value=instance['memory_gb']).border = border
+            ws_instances.cell(row=idx, column=7, value=instance['disk_gb']).border = border
+            ws_instances.cell(row=idx, column=8, value=instance['uptime_hours']).border = border
+            
+            for col, field in enumerate(['cpu_cost', 'memory_cost', 'disk_cost', 'total_cost', 'cost_per_hour'], 9):
+                cell = ws_instances.cell(row=idx, column=col, value=instance[field])
+                cell.number_format = currency_format
+                cell.border = border
+        
+        # 4. Resource Utilization Sheet
+        ws_resources = wb.create_sheet("Resource Utilization")
+        
+        ws_resources['A1'] = "Resource Utilization Summary"
+        ws_resources['A1'].font = title_font
+        ws_resources.merge_cells('A1:D1')
+        
+        # Resource metrics
+        resources = [
+            ("Total vCPUs", report_data['resource_utilization']['total_vcpus']),
+            ("Total Memory (GB)", round(report_data['resource_utilization']['total_memory_gb'], 2)),
+            ("Total Disk (GB)", report_data['resource_utilization']['total_disk_gb']),
+            ("Total Floating IPs", report_data['resource_utilization']['total_floating_ips'])
+        ]
+        
+        row = 3
+        for resource_name, resource_value in resources:
+            ws_resources[f'A{row}'] = resource_name
+            ws_resources[f'A{row}'].font = Font(bold=True)
+            ws_resources[f'C{row}'] = resource_value
+            row += 1
+        
+        # Add pie chart for cost breakdown
+        pie = PieChart()
+        pie.title = "Cost Distribution by Type"
+        labels = Reference(ws_summary, min_col=5, min_row=7, max_row=10)
+        data = Reference(ws_summary, min_col=7, min_row=7, max_row=10)
+        pie.add_data(data)
+        pie.set_categories(labels)
+        ws_summary.add_chart(pie, "A15")
+        
+        # Auto-adjust column widths
+        for ws in wb.worksheets:
+            for column in ws.columns:
+                max_length = 0
+                column = [cell for cell in column]
+                for cell in column:
+                    try:
+                        if len(str(cell.value)) > max_length:
+                            max_length = len(str(cell.value))
+                    except:
+                        pass
+                adjusted_width = min(max_length + 2, 50)
+                if column:
+                    ws.column_dimensions[get_column_letter(column[0].column)].width = adjusted_width
+        
+        # Save the workbook
+        wb.save(filename)
+        return filename
+    
+    def generate_pdf_summary(report_data, filename):
+        """Generate PDF summary with charts"""
+        try:
+            from reportlab.lib import colors
+            from reportlab.lib.pagesizes import letter, A4
+            from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image
+            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+            from reportlab.lib.units import inch
+            
+            # Create PDF
+            doc = SimpleDocTemplate(filename, pagesize=A4)
+            story = []
+            styles = getSampleStyleSheet()
+            
+            # Title
+            title_style = ParagraphStyle(
+                'CustomTitle',
+                parent=styles['Heading1'],
+                fontSize=24,
+                textColor=colors.HexColor('#366092'),
+                spaceAfter=30,
+                alignment=1  # Center
+            )
+            
+            story.append(Paragraph("OpenStack Billing Report", title_style))
+            story.append(Spacer(1, 12))
+            
+            # Period
+            story.append(Paragraph(f"Period: {report_data['summary']['period']}", styles['Normal']))
+            story.append(Paragraph(f"Generated: {report_data['summary']['generated_at']}", styles['Normal']))
+            story.append(Spacer(1, 20))
+            
+            # Summary table
+            summary_data = [
+                ['Metric', 'Value'],
+                ['Total Cost', f"€{report_data['summary']['total_cost']:,.2f}"],
+                ['Total Projects', str(report_data['summary']['total_projects'])],
+                ['Total Instances', str(report_data['summary']['total_instances'])],
+                ['Avg Cost/Instance', f"€{report_data['summary']['avg_cost_per_instance']:,.2f}"],
+                ['Most Expensive Project', report_data['summary']['most_expensive_project'] or 'N/A']
+            ]
+            
+            summary_table = Table(summary_data, colWidths=[3*inch, 2*inch])
+            summary_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 14),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black)
+            ]))
+            
+            story.append(summary_table)
+            story.append(Spacer(1, 30))
+            
+            # Top 5 most expensive projects
+            story.append(Paragraph("Top 5 Most Expensive Projects", styles['Heading2']))
+            
+            top_projects = sorted(report_data['projects'].items(), 
+                                key=lambda x: x[1]['total_cost'], reverse=True)[:5]
+            
+            project_data = [['Project', 'Cost (€)', '% of Total']]
+            total = report_data['summary']['total_cost']
+            
+            for project_name, project_info in top_projects:
+                pct = (project_info['total_cost'] / total * 100) if total > 0 else 0
+                project_data.append([
+                    project_name,
+                    f"€{project_info['total_cost']:,.2f}",
+                    f"{pct:.1f}%"
+                ])
+            
+            project_table = Table(project_data, colWidths=[3*inch, 1.5*inch, 1.5*inch])
+            project_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 12),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black)
+            ]))
+            
+            story.append(project_table)
+            
+            # Build PDF
+            doc.build(story)
+            print(f"PDF report saved: {filename}")
+            
+        except ImportError:
+            print("ReportLab not available, skipping PDF generation")
+    
+    def send_email_report(report_data, recipients):
+        """Send email with report summary"""
+        # This would integrate with your email service
+        # Example implementation would use smtplib or a service like SendGrid
+        pass
+    
+    def main():
+        """Main function"""
+        print("OpenStack Enhanced Billing Report Generator")
+        print("==========================================")
+        
+        # Determine time period
+        if len(sys.argv) > 2:
+            start_date = datetime.strptime(sys.argv[1], '%Y-%m-%d')
+            end_date = datetime.strptime(sys.argv[2], '%Y-%m-%d')
+        else:
+            # Default: current month
+            end_date = datetime.now()
+            start_date = end_date.replace(day=1)
+        
+        print(f"Generating report for period: {start_date.date()} to {end_date.date()}")
+        
+        # Load pricing configuration
+        pricing = load_pricing_config()
+        print(f"Loaded pricing configuration: {pricing}")
+        
+        # Fetch metrics
+        print("Fetching metrics...")
+        metrics = fetch_metrics()
+        
+        if not metrics:
+            print("Error: Could not fetch metrics")
+            sys.exit(1)
+        
+        # Generate report
+        print("Generating report...")
+        report_data = generate_billing_report(metrics, start_date, end_date, pricing)
+        
+        # Load and update history
+        history = load_history()
+        history['daily'].append({
+            'date': end_date.strftime('%Y-%m-%d'),
+            'total_cost': report_data['summary']['total_cost'],
+            'instances': report_data['summary']['total_instances'],
+            'projects': report_data['summary']['total_projects']
+        })
+        
+        # Keep only last 90 days
+        history['daily'] = history['daily'][-90:]
+        save_history(history)
+        
+        # Calculate trend
+        trend = calculate_trend(report_data['summary']['total_cost'], history['daily'])
+        report_data['summary']['cost_trend_7d'] = round(trend, 1)
+        
+        # Create report directory
+        os.makedirs(REPORT_DIR, exist_ok=True)
+        
+        # Save JSON report
+        json_filename = os.path.join(
+            REPORT_DIR, 
+            f"billing_report_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.json"
+        )
+        with open(json_filename, 'w') as f:
+            json.dump(report_data, f, indent=2)
+        print(f"JSON report saved: {json_filename}")
+        
+        # Generate Excel report with charts
+        excel_filename = os.path.join(
+            REPORT_DIR, 
+            f"billing_report_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
+        )
+        generate_excel_report(report_data, excel_filename)
+        print(f"Excel report saved: {excel_filename}")
+        
+        # Generate PDF summary
+        pdf_filename = os.path.join(
+            REPORT_DIR,
+            f"billing_summary_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.pdf"
+        )
+        generate_pdf_summary(report_data, pdf_filename)
+        
+        # Print summary
+        print("\nReport Summary:")
+        print(f"Total projects: {report_data['summary']['total_projects']}")
+        print(f"Total instances: {report_data['summary']['total_instances']}")
+        print(f"Total cost: €{report_data['summary']['total_cost']:.2f}")
+        print(f"7-day trend: {report_data['summary']['cost_trend_7d']:.1f}%")
+        print(f"Most expensive project: {report_data['summary']['most_expensive_project']}")
+        print(f"Most expensive instance: {report_data['summary']['most_expensive_instance']}")
+    
+    if __name__ == '__main__':
+        main()
+
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: billing-report-generator
+  namespace: openstack
+spec:
+  schedule: "0 6 1 * *"  # Run at 6 AM on the first day of each month
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: report-generator
+            image: python:3.9-slim
+            command: ["/bin/bash", "-c"]
+            args:
+              - |
+                # Configurer l'environnement pour installer les packages dans /tmp
+                export PYTHONUSERBASE=/tmp/python-packages
+                export PATH=$PYTHONUSERBASE/bin:$PATH
+                mkdir -p $PYTHONUSERBASE
+                
+                # Installer les packages
+                pip install --user pandas openpyxl requests matplotlib reportlab
+                
+                # Générer le rapport pour le mois précédent
+                python /scripts/generate-report.py $(date -d "1 month ago" +%Y-%m-01) $(date +%Y-%m-01)
+            env:
+            - name: EXPORTER_URL
+              value: "http://billing-exporter:9999/metrics"
+            - name: API_URL
+              value: "http://billing-api:8080/api/v1"
+            volumeMounts:
+            - name: script
+              mountPath: /scripts
+            - name: reports
+              mountPath: /reports
+          volumes:
+          - name: script
+            configMap:
+              name: billing-report-script
+              defaultMode: 0755
+          - name: reports
+            persistentVolumeClaim:
+              claimName: billing-reports-pvc
+          restartPolicy: OnFailure
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: billing-reports-pvc
+  namespace: openstack
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: lvms-vg1
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: billing-report-manual
+  namespace: openstack
+spec:
+  template:
+    spec:
+      containers:
+      - name: report-generator
+        image: python:3.9-slim
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            # Configurer l'environnement pour installer les packages dans /tmp
+            export PYTHONUSERBASE=/tmp/python-packages
+            export PATH=$PYTHONUSERBASE/bin:$PATH
+            mkdir -p $PYTHONUSERBASE
+            
+            # Installer les packages
+            pip install --user pandas openpyxl requests matplotlib reportlab
+            
+            # Générer le rapport pour le mois en cours
+            python /scripts/generate-report.py
+        env:
+        - name: EXPORTER_URL
+          value: "http://billing-exporter:9999/metrics"
+        - name: API_URL
+          value: "http://billing-api:8080/api/v1"
+        volumeMounts:
+        - name: script
+          mountPath: /scripts
+        - name: reports
+          mountPath: /reports
+      volumes:
+      - name: script
+        configMap:
+          name: billing-report-script
+          defaultMode: 0755
+      - name: reports
+        persistentVolumeClaim:
+          claimName: billing-reports-pvc
+      restartPolicy: OnFailure
