@@ -1,0 +1,272 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: billing-prometheus-rules
+  namespace: openstack
+  labels:
+    prometheus: kube-prometheus
+    role: alert-rules
+data:
+  billing.rules.yaml: |
+    groups:
+    - name: billing.rules
+      interval: 30s
+      rules:
+      
+      # Alerte si l'exporteur est down
+      - alert: BillingExporterDown
+        expr: up{job="billing-exporter"} == 0 or openstack_billing_exporter_up == 0
+        for: 5m
+        labels:
+          severity: critical
+          service: billing
+        annotations:
+          summary: "Billing exporter is down"
+          description: "The billing metrics exporter has been down for more than 5 minutes."
+          
+      # Alerte si aucune métrique n'est collectée
+      - alert: BillingNoMetricsCollected
+        expr: rate(openstack_instance_uptime_hours[5m]) == 0
+        for: 15m
+        labels:
+          severity: warning
+          service: billing
+        annotations:
+          summary: "No billing metrics collected"
+          description: "No instance metrics have been collected for the last 15 minutes."
+          
+      # Alerte sur augmentation anormale des coûts (>50% en 1h)
+      - alert: BillingCostSpike
+        expr: |
+          (
+            sum(rate(openstack_instance_uptime_hours[1h]) * 0.05 * openstack_instance_vcpus) 
+            / 
+            sum(rate(openstack_instance_uptime_hours[1h] offset 1h) * 0.05 * openstack_instance_vcpus)
+          ) > 1.5
+        for: 10m
+        labels:
+          severity: warning
+          service: billing
+        annotations:
+          summary: "Billing cost spike detected"
+          description: "Billing costs have increased by more than 50% in the last hour."
+          
+      # Alerte si un projet dépasse un seuil de coût quotidien
+      - alert: BillingProjectCostThreshold
+        expr: |
+          sum by (project_name) (
+            openstack_instance_uptime_hours * 0.05 * openstack_instance_vcpus +
+            openstack_instance_uptime_hours * 0.01 * (openstack_instance_memory_mb / 1024) +
+            openstack_instance_uptime_hours * 0.000137 * openstack_instance_disk_gb
+          ) > 100
+        for: 30m
+        labels:
+          severity: warning
+          service: billing
+        annotations:
+          summary: "Project {{ $labels.project_name }} exceeds daily cost threshold"
+          description: "Project {{ $labels.project_name }} has exceeded €100 in daily costs (current: €{{ $value | printf \"%.2f\" }})"
+          
+      # Alerte si les tarifs n'ont pas été mis à jour depuis longtemps
+      - alert: BillingPricingStale
+        expr: |
+          (time() - openstack_pricing_last_updated_timestamp) > 2592000  # 30 jours
+        for: 1h
+        labels:
+          severity: info
+          service: billing
+        annotations:
+          summary: "Billing pricing configuration is stale"
+          description: "Pricing configuration has not been updated for more than 30 days."
+          
+      # Alerte si l'utilisation des ressources est très élevée
+      - alert: BillingHighResourceUsage
+        expr: |
+          sum(openstack_instance_vcpus) > 1000
+          or
+          sum(openstack_instance_memory_mb) / 1024 > 4000
+          or 
+          sum(openstack_instance_disk_gb) > 10000
+        for: 1h
+        labels:
+          severity: info
+          service: billing
+        annotations:
+          summary: "High resource usage detected"
+          description: "Total resource usage is very high: vCPUs={{ $value }}"
+          
+      # Alerte si le rapport mensuel n'a pas été généré
+      - alert: BillingReportGenerationFailed
+        expr: |
+          (day_of_month() == 2) and (hour() >= 12) and 
+          (time() - max(kube_job_status_completion_time{job_name=~"billing-report-.*"}) > 129600)  # 36 heures
+        for: 1h
+        labels:
+          severity: warning
+          service: billing
+        annotations:
+          summary: "Monthly billing report not generated"
+          description: "The monthly billing report has not been generated. Last successful generation was {{ $value | humanizeDuration }} ago."
+          
+      # Alerte sur l'espace disque des rapports
+      - alert: BillingReportStorageFull
+        expr: |
+          (
+            kubelet_volume_stats_used_bytes{persistentvolumeclaim="billing-reports-pvc"} 
+            / 
+            kubelet_volume_stats_capacity_bytes{persistentvolumeclaim="billing-reports-pvc"}
+          ) > 0.8
+        for: 30m
+        labels:
+          severity: warning
+          service: billing
+        annotations:
+          summary: "Billing reports storage almost full"
+          description: "Billing reports PVC is {{ $value | humanizePercentage }} full."
+
+    - name: billing.recording.rules
+      interval: 5m
+      rules:
+      
+      # Coût total par projet (règle de recording pour performance)
+      - record: billing:project_total_cost:5m
+        expr: |
+          sum by (project_name) (
+            openstack_instance_uptime_hours * 0.05 * openstack_instance_vcpus +
+            openstack_instance_uptime_hours * 0.01 * (openstack_instance_memory_mb / 1024) +
+            openstack_instance_uptime_hours * 0.000137 * openstack_instance_disk_gb +
+            openstack_floating_ip_count * 24 * 0.0069
+          )
+          
+      # Coût moyen par instance
+      - record: billing:instance_average_cost:5m
+        expr: |
+          avg(
+            openstack_instance_uptime_hours * 0.05 * openstack_instance_vcpus +
+            openstack_instance_uptime_hours * 0.01 * (openstack_instance_memory_mb / 1024) +
+            openstack_instance_uptime_hours * 0.000137 * openstack_instance_disk_gb
+          )
+          
+      # Utilisation totale des ressources
+      - record: billing:total_vcpus:5m
+        expr: sum(openstack_instance_vcpus)
+        
+      - record: billing:total_memory_gb:5m
+        expr: sum(openstack_instance_memory_mb) / 1024
+        
+      - record: billing:total_disk_gb:5m
+        expr: sum(openstack_instance_disk_gb)
+        
+      # Taux de croissance des coûts (sur 24h)
+      - record: billing:cost_growth_rate:24h
+        expr: |
+          (
+            sum(rate(openstack_instance_uptime_hours[24h]) * 0.05 * openstack_instance_vcpus)
+            -
+            sum(rate(openstack_instance_uptime_hours[24h] offset 24h) * 0.05 * openstack_instance_vcpus)
+          ) / sum(rate(openstack_instance_uptime_hours[24h] offset 24h) * 0.05 * openstack_instance_vcpus)
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: billing-exporter
+  namespace: openstack
+  labels:
+    app: billing-exporter
+    prometheus: kube-prometheus
+spec:
+  selector:
+    matchLabels:
+      app: billing-exporter
+  endpoints:
+  - port: metrics
+    interval: 30s
+    path: /metrics
+    scheme: http
+    relabelings:
+    - sourceLabels: [__address__]
+      targetLabel: __address__
+      regex: (.+)
+      replacement: ${1}
+    - sourceLabels: [__meta_kubernetes_service_name]
+      targetLabel: job
+      replacement: billing-exporter
+    - sourceLabels: [__meta_kubernetes_namespace]
+      targetLabel: namespace
+    - sourceLabels: [__meta_kubernetes_pod_name]
+      targetLabel: pod
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: billing-alertmanager-config
+  namespace: openstack
+data:
+  alertmanager.yaml: |
+    global:
+      resolve_timeout: 5m
+      
+    route:
+      group_by: ['alertname', 'severity', 'service']
+      group_wait: 10s
+      group_interval: 10s
+      repeat_interval: 1h
+      receiver: 'billing-team'
+      routes:
+      - match:
+          service: billing
+          severity: critical
+        receiver: billing-critical
+        repeat_interval: 15m
+      - match:
+          service: billing
+          severity: warning
+        receiver: billing-warning
+        repeat_interval: 30m
+      - match:
+          service: billing
+          severity: info
+        receiver: billing-info
+        repeat_interval: 12h
+        
+    receivers:
+    - name: 'billing-team'
+      email_configs:
+      - to: 'billing-team@example.com'
+        from: 'alertmanager@example.com'
+        smarthost: 'smtp.example.com:587'
+        auth_username: 'alertmanager@example.com'
+        auth_password: 'password'
+        headers:
+          Subject: '[OpenStack Billing] {{ .GroupLabels.alertname }} - {{ .GroupLabels.severity }}'
+          
+    - name: 'billing-critical'
+      email_configs:
+      - to: 'billing-oncall@example.com'
+        from: 'alertmanager@example.com'
+        smarthost: 'smtp.example.com:587'
+        auth_username: 'alertmanager@example.com'
+        auth_password: 'password'
+        headers:
+          Subject: '[CRITICAL] OpenStack Billing Alert: {{ .GroupLabels.alertname }}'
+      webhook_configs:
+      - url: 'http://billing-webhook.example.com/critical'
+        send_resolved: true
+        
+    - name: 'billing-warning'
+      email_configs:
+      - to: 'billing-team@example.com'
+        from: 'alertmanager@example.com'
+        smarthost: 'smtp.example.com:587'
+        auth_username: 'alertmanager@example.com'
+        auth_password: 'password'
+        
+    - name: 'billing-info'
+      webhook_configs:
+      - url: 'http://billing-webhook.example.com/info'
+        send_resolved: false
+        
+    templates:
+    - '/etc/alertmanager/templates/*.tmpl'
